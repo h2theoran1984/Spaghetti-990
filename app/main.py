@@ -10,8 +10,8 @@ from .propublica import get_organization, extract_object_ids
 from .irs_xml import get_schedule_r
 
 app = FastAPI(
-    title="990 Entity Graph",
-    description="Given an EIN, returns the web of related organizations from IRS Form 990 Schedule R filings.",
+    title="Spaghetti 990",
+    description="Healthcare org structures look like spaghetti. Feed it one EIN, get back the full org tree from IRS Form 990 Schedule R.",
     version="0.1.0",
 )
 

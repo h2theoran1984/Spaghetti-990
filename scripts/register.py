@@ -19,12 +19,12 @@ if not API_KEY:
     sys.exit(1)
 
 AGENT = {
-    "name": "Form 990 Entity Graph",
+    "name": "Spaghetti 990",
     "slug": "990-entity-graph",
     "description": (
-        "Unravels the Byzantine web of nonprofit healthcare organizations. "
+        "Healthcare org structures look like spaghetti. Spaghetti 990 untangles them. "
         "Feed it one EIN, get back the full org tree from IRS Form 990 Schedule R. "
-        "Health systems, foundations, subsidiaries — nothing hides from Schedule R."
+        "Health systems, foundations, subsidiaries, shell LLCs — nothing hides from Schedule R."
     ),
     "tags": ["healthcare", "990", "nonprofit", "irs", "entity-graph", "schedule-r"],
     "rate_type": "per_call",
