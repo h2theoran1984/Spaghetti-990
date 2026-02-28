@@ -7,96 +7,189 @@ IRS publishes machine-readable 990 XML in monthly bulk ZIP archives at:
 Index CSV maps EINs to ObjectIds:
   https://apps.irs.gov/pub/epostcard/990/xml/{year}/index_{year}.csv
 
-Schedule R (Part V) contains related tax-exempt organizations:
-  - EIN
-  - Name
-  - Relationship (Parent, Subsidiary, Brother/Sister, Supporting, Supported)
-  - Controlling percentage (if applicable)
+Schedule R (Part V) contains related tax-exempt organizations.
 """
 import io
 import csv
-import zipfile
+import struct
+import zlib
 import datetime
 
 import httpx
-import remotezip
 from lxml import etree
 
 IRS_BASE = "https://apps.irs.gov/pub/epostcard/990/xml"
 
-# IRS 990 XML namespaces vary by year — handle both
-NS_URI = "http://www.irs.gov/efile"
+# ---------------------------------------------------------------------------
+# Async ZIP streaming helpers
+# ---------------------------------------------------------------------------
+# We use HTTP range requests to avoid downloading full 100-1200MB batch ZIPs.
+# Algorithm:
+#   1. Fetch the last 64KB of the ZIP → find End of Central Directory (EOCD)
+#   2. Parse EOCD → CDR offset + size
+#   3. Fetch CDR bytes → find our filename + its local header offset
+#   4. Fetch local file header → compute data offset + compressed size
+#   5. Fetch compressed bytes → zlib decompress → return XML
+# ---------------------------------------------------------------------------
+
+EOCD_SIG = b"PK\x05\x06"
+LFH_SIG = b"PK\x03\x04"
+CDR_SIG = b"PK\x01\x02"
 
 
-def _julian_to_month(julian_day: int, year: int) -> int:
-    """Convert a Julian day number to a calendar month (1-12)."""
-    try:
-        dt = datetime.date(year, 1, 1) + datetime.timedelta(days=julian_day - 1)
-        return dt.month
-    except (ValueError, OverflowError):
-        return 1
+async def _range_get(client: httpx.AsyncClient, url: str, start: int, end: int) -> bytes:
+    """Fetch a byte range from a URL."""
+    resp = await client.get(url, headers={"Range": f"bytes={start}-{end}"})
+    resp.raise_for_status()
+    return resp.content
 
 
-def _object_id_to_zip_url(object_id: str) -> list[str]:
+async def _get_content_length(client: httpx.AsyncClient, url: str) -> int | None:
+    """HEAD request to get file size."""
+    resp = await client.head(url)
+    if resp.status_code in (200, 206):
+        cl = resp.headers.get("content-length")
+        return int(cl) if cl else None
+    return None
+
+
+async def _find_xml_in_zip(client: httpx.AsyncClient, zip_url: str, target_name: str) -> bytes | None:
     """
-    Derive likely batch ZIP URLs from an ObjectId.
+    Async streaming ZIP extraction — only downloads what's needed.
+    Returns the decompressed content of target_name, or None if not found.
+    """
+    # 1. Get file size
+    total_size = await _get_content_length(client, zip_url)
+    if not total_size:
+        return None
 
-    ObjectId format (18 digits): YYYYDDDXXXXXXXXXXXXXX
-      YYYY = year filed
-      DDD  = Julian day (digits 5-7, but IRS uses 2-digit day portion)
+    # 2. Fetch last 64KB to locate EOCD
+    tail_size = min(65536, total_size)
+    tail = await _range_get(client, zip_url, total_size - tail_size, total_size - 1)
 
-    Returns a list of candidate ZIP URLs to try (most likely first).
+    eocd_pos = tail.rfind(EOCD_SIG)
+    if eocd_pos == -1:
+        return None
+
+    eocd = tail[eocd_pos:]
+    if len(eocd) < 22:
+        return None
+
+    # EOCD structure (offsets from signature start):
+    # 4 sig | 2 disk# | 2 cdr_disk | 2 entries_this | 2 entries_total
+    # 4 cdr_size | 4 cdr_offset | 2 comment_len
+    cdr_size = struct.unpack_from("<I", eocd, 12)[0]
+    cdr_offset = struct.unpack_from("<I", eocd, 16)[0]
+
+    # ZIP64 check
+    if cdr_offset == 0xFFFFFFFF:
+        return None  # ZIP64 not handled
+
+    # 3. Fetch Central Directory
+    cdr_bytes = await _range_get(client, zip_url, cdr_offset, cdr_offset + cdr_size - 1)
+
+    # 4. Scan CDR for our filename
+    target_bytes = target_name.encode()
+    pos = 0
+    while pos < len(cdr_bytes) - 46:
+        if cdr_bytes[pos:pos+4] != CDR_SIG:
+            break
+        # CDR entry layout (from signature):
+        # 4 sig | 2 ver_made | 2 ver_needed | 2 flags | 2 method
+        # 2 mod_time | 2 mod_date | 4 crc32
+        # 4 compressed_size | 4 uncompressed_size
+        # 2 fname_len | 2 extra_len | 2 comment_len | 2 disk_start
+        # 2 int_attrs | 4 ext_attrs | 4 local_header_offset
+        compressed_size = struct.unpack_from("<I", cdr_bytes, pos + 20)[0]
+        fname_len = struct.unpack_from("<H", cdr_bytes, pos + 28)[0]
+        extra_len = struct.unpack_from("<H", cdr_bytes, pos + 30)[0]
+        comment_len = struct.unpack_from("<H", cdr_bytes, pos + 32)[0]
+        method = struct.unpack_from("<H", cdr_bytes, pos + 10)[0]
+        local_offset = struct.unpack_from("<I", cdr_bytes, pos + 42)[0]
+        fname = cdr_bytes[pos + 46: pos + 46 + fname_len]
+
+        entry_size = 46 + fname_len + extra_len + comment_len
+        if fname == target_bytes:
+            # 5. Fetch local file header to find data offset
+            lfh = await _range_get(client, zip_url, local_offset, local_offset + 29)
+            if lfh[:4] != LFH_SIG:
+                return None
+            lfh_fname_len = struct.unpack_from("<H", lfh, 26)[0]
+            lfh_extra_len = struct.unpack_from("<H", lfh, 28)[0]
+            data_offset = local_offset + 30 + lfh_fname_len + lfh_extra_len
+
+            # 6. Fetch compressed data
+            if compressed_size == 0:
+                return None
+            compressed = await _range_get(client, zip_url, data_offset, data_offset + compressed_size - 1)
+
+            # 7. Decompress
+            if method == 0:  # stored
+                return compressed
+            elif method == 8:  # deflated
+                return zlib.decompress(compressed, -zlib.MAX_WBITS)
+            return None
+
+        pos += entry_size
+
+    return None
+
+
+def _object_id_to_zip_urls(object_id: str) -> list[str]:
+    """
+    Derive candidate batch ZIP URLs from an ObjectId.
+    ObjectId format: YYYY DD XX...  (YYYY=year, DD=Julian day digits 5-6)
     """
     if len(object_id) < 6:
         return []
 
     try:
         year = int(object_id[:4])
-        # Digits 5-6 encode Julian day in IRS DLN format
         julian_day = int(object_id[4:6])
-        month = _julian_to_month(julian_day, year)
-    except (ValueError, IndexError):
+        base = datetime.date(year, 1, 1) + datetime.timedelta(days=julian_day - 1)
+        month = base.month
+    except (ValueError, OverflowError):
         year = datetime.date.today().year
         month = 1
 
-    # Build candidate URLs: primary month first, then the rest
     candidates = []
-    for suffix in ["A", "B"]:
-        candidates.append(f"{IRS_BASE}/{year}/{year}_TEOS_XML_{month:02d}{suffix}.zip")
-    # Add surrounding months as fallback
-    for delta in [-1, 1, 2, -2]:
-        m = ((month - 1 + delta) % 12) + 1
-        y = year + (month - 1 + delta) // 12
-        candidates.append(f"{IRS_BASE}/{y}/{y}_TEOS_XML_{m:02d}A.zip")
+    # Try primary month (A and B batches), then neighbours
+    for m_delta in [0, -1, 1, 2, -2]:
+        raw = month - 1 + m_delta
+        m = (raw % 12) + 1
+        y = year + raw // 12
+        for suffix in ["A", "B"]:
+            candidates.append(f"{IRS_BASE}/{y}/{y}_TEOS_XML_{m:02d}{suffix}.zip")
 
     return candidates
 
 
+# ---------------------------------------------------------------------------
+# IRS index CSV lookup
+# ---------------------------------------------------------------------------
+
 async def find_object_id_via_index(ein: str) -> tuple[str | None, str | None]:
     """
-    Look up EIN in the IRS index CSVs to find the latest 990 ObjectId.
+    Search IRS index CSVs to find the latest 990 ObjectId for an EIN.
     Returns (object_id, tax_period) or (None, None).
-    Searches the last 4 years.
     """
     clean = ein.replace("-", "")
     current_year = datetime.date.today().year
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        for year in range(current_year, current_year - 4, -1):
+        for year in range(current_year, current_year - 5, -1):
             url = f"{IRS_BASE}/{year}/index_{year}.csv"
             try:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     continue
                 reader = csv.DictReader(io.StringIO(resp.text))
-                # Collect all 990 filings for this EIN (not 990T/990EZ)
                 matches = []
                 for row in reader:
                     row_ein = row.get("EIN", "").strip().replace("-", "")
                     if row_ein == clean and row.get("RETURN_TYPE", "").strip() == "990":
                         matches.append(row)
                 if matches:
-                    # Sort by OBJECT_ID descending (newest first)
                     matches.sort(key=lambda r: r.get("OBJECT_ID", ""), reverse=True)
                     best = matches[0]
                     return best.get("OBJECT_ID"), best.get("TAX_PERIOD")
@@ -106,33 +199,13 @@ async def find_object_id_via_index(ein: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-async def fetch_xml_from_zip(object_id: str) -> bytes | None:
-    """
-    Fetch a single 990 XML file from an IRS batch ZIP using HTTP range requests.
-    Only downloads the Central Directory + the specific compressed file — not the full ZIP.
-    """
-    filename = f"{object_id}_public.xml"
-    zip_urls = _object_id_to_zip_url(object_id)
-
-    for zip_url in zip_urls:
-        try:
-            with remotezip.RemoteZip(zip_url) as rz:
-                names = rz.namelist()
-                if filename in names:
-                    return rz.read(filename)
-        except Exception:
-            continue
-
-    return None
-
+# ---------------------------------------------------------------------------
+# XML parser
+# ---------------------------------------------------------------------------
 
 def parse_schedule_r(xml_bytes: bytes) -> list[dict]:
-    """
-    Parse Schedule R Part V — Related Tax-Exempt Organizations.
-    Returns list of related org dicts with EIN, name, relationship, etc.
-    """
+    """Parse Schedule R — related tax-exempt organizations."""
     related = []
-
     try:
         root = etree.fromstring(xml_bytes)
     except etree.XMLSyntaxError:
@@ -142,15 +215,12 @@ def parse_schedule_r(xml_bytes: bytes) -> list[dict]:
     ns = {"irs": ns_uri} if ns_uri else {}
 
     def find_all(tag: str):
-        if ns_uri:
-            return root.findall(f".//irs:{tag}", ns)
-        return root.findall(f".//{tag}")
+        return root.findall(f".//irs:{tag}", ns) if ns_uri else root.findall(f".//{tag}")
 
     def text(el, tag: str) -> str | None:
         child = el.find(f"irs:{tag}", ns) if ns_uri else el.find(tag)
         return child.text.strip() if child is not None and child.text else None
 
-    # Schedule R Part V: Related Tax-Exempt Orgs
     for org_el in find_all("IdRelatedTaxExemptOrgGrp"):
         ein_val = text(org_el, "EIN") or text(org_el, "EINOfRelatedOrg")
         name_val = (
@@ -159,40 +229,28 @@ def parse_schedule_r(xml_bytes: bytes) -> list[dict]:
             or text(org_el, "BusinessName")
         )
         if not name_val:
-            bn = (
-                org_el.find(".//irs:BusinessNameLine1Txt", ns)
-                if ns_uri
-                else org_el.find(".//BusinessNameLine1Txt")
-            )
+            bn = (org_el.find(".//irs:BusinessNameLine1Txt", ns)
+                  if ns_uri else org_el.find(".//BusinessNameLine1Txt"))
             if bn is not None and bn.text:
                 name_val = bn.text.strip()
 
-        rel = (
-            text(org_el, "OrganizationRelationship")
-            or text(org_el, "PrimaryActivitiesCd")
-            or "Related"
-        )
+        rel = text(org_el, "OrganizationRelationship") or text(org_el, "PrimaryActivitiesCd") or "Related"
         pct_el = text(org_el, "OwnershipPct") or text(org_el, "ControllingInterestPct")
-        pct = float(pct_el) if pct_el else None
 
         if ein_val:
             related.append({
                 "ein": ein_val,
                 "name": name_val or "Unknown",
                 "relationship": rel,
-                "controlling_pct": pct,
+                "controlling_pct": float(pct_el) if pct_el else None,
             })
 
-    # Also check Part IV: Taxable Entities / Partnerships
     for org_el in find_all("IdRelatedOrgTaxablePartnershipGrp"):
         ein_val = text(org_el, "EIN")
         name_val = text(org_el, "OrganizationName") or text(org_el, "BusinessName")
         if not name_val:
-            bn = (
-                org_el.find(".//irs:BusinessNameLine1Txt", ns)
-                if ns_uri
-                else org_el.find(".//BusinessNameLine1Txt")
-            )
+            bn = (org_el.find(".//irs:BusinessNameLine1Txt", ns)
+                  if ns_uri else org_el.find(".//BusinessNameLine1Txt"))
             if bn is not None and bn.text:
                 name_val = bn.text.strip()
         if ein_val:
@@ -206,37 +264,42 @@ def parse_schedule_r(xml_bytes: bytes) -> list[dict]:
     return related
 
 
-async def get_schedule_r(ein: str, _object_ids_unused: list[str]) -> tuple[list[dict], str | None]:
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+async def get_schedule_r(ein: str, _unused: list[str]) -> tuple[list[dict], str | None]:
     """
     Get Schedule R data for an EIN.
-    Uses IRS index CSV to find the correct ObjectId, then streams the XML from the batch ZIP.
-    Returns (related_entities, filing_year_or_None).
+    Uses IRS index CSV → async streaming ZIP extraction → XML parse.
     """
     object_id, tax_period = await find_object_id_via_index(ein)
-
-    if not object_id:
-        return [], None
-
-    # Derive filing year from tax_period (format: YYYYMM)
     filing_year = tax_period[:4] if tax_period and len(tax_period) >= 4 else None
 
-    xml = await fetch_xml_from_zip(object_id)
-    if not xml:
-        # Index found the filing but we couldn't stream the XML
-        # Return empty relations but with the filing year we know
+    if not object_id:
         return [], filing_year
 
-    related = parse_schedule_r(xml)
+    target_name = f"{object_id}_public.xml"
+    zip_urls = _object_id_to_zip_urls(object_id)
 
-    # Also extract TaxYr from XML for accuracy
-    try:
-        root = etree.fromstring(xml)
-        ns_uri = root.nsmap.get(None) or ""
-        ns = {"irs": ns_uri} if ns_uri else {}
-        ty = root.find(".//irs:TaxYr", ns) if ns_uri else root.find(".//TaxYr")
-        if ty is not None and ty.text:
-            filing_year = ty.text
-    except Exception:
-        pass
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for zip_url in zip_urls:
+            try:
+                xml = await _find_xml_in_zip(client, zip_url, target_name)
+                if xml:
+                    related = parse_schedule_r(xml)
+                    # Extract TaxYr from XML
+                    try:
+                        root = etree.fromstring(xml)
+                        ns_uri = root.nsmap.get(None) or ""
+                        ns = {"irs": ns_uri} if ns_uri else {}
+                        ty = root.find(".//irs:TaxYr", ns) if ns_uri else root.find(".//TaxYr")
+                        if ty is not None and ty.text:
+                            filing_year = ty.text
+                    except Exception:
+                        pass
+                    return related, filing_year
+            except Exception:
+                continue
 
-    return related, filing_year
+    return [], filing_year
