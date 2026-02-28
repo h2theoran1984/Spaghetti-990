@@ -135,32 +135,29 @@ async def _find_xml_in_zip(client: httpx.AsyncClient, zip_url: str, target_name:
     return None
 
 
+def _batch_to_zip_url(batch_name: str) -> str:
+    """Convert a batch name like '2025_TEOS_XML_11D' to its full URL."""
+    year = batch_name[:4]
+    return f"{IRS_BASE}/{year}/{batch_name}.zip"
+
+
 def _object_id_to_zip_urls(object_id: str) -> list[str]:
     """
-    Derive candidate batch ZIP URLs from an ObjectId.
-    ObjectId format: YYYY DD XX...  (YYYY=year, DD=Julian day digits 5-6)
+    Fallback: derive candidate batch ZIP URLs from an ObjectId when the index
+    doesn't include an explicit batch column (older filings).
+    Tries all 12 months × A/B suffixes for the filing year.
     """
-    if len(object_id) < 6:
+    if len(object_id) < 4:
         return []
-
     try:
         year = int(object_id[:4])
-        julian_day = int(object_id[4:6])
-        base = datetime.date(year, 1, 1) + datetime.timedelta(days=julian_day - 1)
-        month = base.month
-    except (ValueError, OverflowError):
+    except ValueError:
         year = datetime.date.today().year
-        month = 1
 
     candidates = []
-    # Try primary month (A and B batches), then neighbours
-    for m_delta in [0, -1, 1, 2, -2]:
-        raw = month - 1 + m_delta
-        m = (raw % 12) + 1
-        y = year + raw // 12
-        for suffix in ["A", "B"]:
-            candidates.append(f"{IRS_BASE}/{y}/{y}_TEOS_XML_{m:02d}{suffix}.zip")
-
+    for month in range(1, 13):
+        for suffix in ["A", "B", "C", "D"]:
+            candidates.append(f"{IRS_BASE}/{year}/{year}_TEOS_XML_{month:02d}{suffix}.zip")
     return candidates
 
 
@@ -168,11 +165,15 @@ def _object_id_to_zip_urls(object_id: str) -> list[str]:
 # IRS index CSV lookup
 # ---------------------------------------------------------------------------
 
-async def find_object_id_via_index(ein: str) -> tuple[str | None, str | None]:
+async def find_object_id_via_index(ein: str) -> tuple[str | None, str | None, str | None]:
     """
     Search IRS index CSVs to find the latest 990 ObjectId for an EIN.
     Streams each CSV line-by-line — never loads the full file into memory.
-    Returns (object_id, tax_period) or (None, None).
+    Returns (object_id, tax_period, batch_zip_name) or (None, None, None).
+
+    Newer index files (2025+) include a 10th column with the exact batch ZIP name,
+    e.g. "2025_TEOS_XML_11D".  Older indexes have only 9 columns; in that case
+    batch_zip_name is None and we fall back to the Julian-day heuristic.
     """
     clean = ein.replace("-", "")
     current_year = datetime.date.today().year
@@ -190,31 +191,36 @@ async def find_object_id_via_index(ein: str) -> tuple[str | None, str | None]:
                     async for chunk in resp.aiter_text(chunk_size=65536):
                         line_buf += chunk
                         lines = line_buf.split("\n")
-                        line_buf = lines[-1]  # keep partial last line
+                        line_buf = lines[-1]
                         for raw_line in lines[:-1]:
                             raw_line = raw_line.strip()
                             if not raw_line:
                                 continue
                             if header is None:
-                                header = [h.strip() for h in raw_line.split(",")]
+                                cols = [h.strip() for h in raw_line.split(",")]
+                                # Name the 10th column if present
+                                if len(cols) >= 10 and not cols[9]:
+                                    cols[9] = "XML_BATCH"
+                                elif len(cols) >= 10:
+                                    cols[9] = cols[9] or "XML_BATCH"
+                                header = cols
                                 continue
-                            # Simple CSV split (field values don't contain commas)
                             parts = raw_line.split(",")
-                            if len(parts) < len(header):
+                            if len(parts) < 9:
                                 continue
                             row = dict(zip(header, parts))
                             row_ein = row.get("EIN", "").strip().replace("-", "")
                             if row_ein == clean and row.get("RETURN_TYPE", "").strip() == "990":
-                                # Keep highest OBJECT_ID (latest filing)
                                 if best is None or row.get("OBJECT_ID", "") > best.get("OBJECT_ID", ""):
                                     best = row
             except Exception:
                 pass
 
             if best:
-                return best.get("OBJECT_ID"), best.get("TAX_PERIOD")
+                batch = best.get("XML_BATCH", "").strip() or None
+                return best.get("OBJECT_ID"), best.get("TAX_PERIOD"), batch
 
-    return None, None
+    return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -291,16 +297,21 @@ async def get_schedule_r(ein: str, _unused: list[str]) -> tuple[list[dict], str 
     Get Schedule R data for an EIN.
     Uses IRS index CSV → async streaming ZIP extraction → XML parse.
     """
-    object_id, tax_period = await find_object_id_via_index(ein)
+    object_id, tax_period, batch_name = await find_object_id_via_index(ein)
     filing_year = tax_period[:4] if tax_period and len(tax_period) >= 4 else None
 
     if not object_id:
         return [], filing_year
 
     target_name = f"{object_id}_public.xml"
-    zip_urls = _object_id_to_zip_urls(object_id)
 
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+    # Use the exact batch ZIP from the index when available, otherwise guess
+    if batch_name:
+        zip_urls = [_batch_to_zip_url(batch_name)]
+    else:
+        zip_urls = _object_id_to_zip_urls(object_id)
+
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
         for zip_url in zip_urls:
             try:
                 xml = await _find_xml_in_zip(client, zip_url, target_name)
