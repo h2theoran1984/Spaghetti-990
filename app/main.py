@@ -103,6 +103,51 @@ async def lookup_entity_graph(req: EntityGraphRequest):
     )
 
 
+@app.get("/debug/connectivity")
+async def debug_connectivity():
+    """Test EFTS and IRS S3 connectivity from this server."""
+    import httpx
+    results = {}
+
+    # Test EFTS
+    efts_url = "https://efts.irs.gov/LATEST/search-index?q=%22340714585%22&forms=990"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(efts_url)
+            data = resp.json()
+            hits = data.get("hits", {}).get("hits", [])
+            if hits:
+                obj_id = hits[0].get("_source", {}).get("ObjectId")
+                results["efts"] = {"status": resp.status_code, "object_id": obj_id, "hit_count": len(hits)}
+            else:
+                results["efts"] = {"status": resp.status_code, "hits": 0}
+    except Exception as e:
+        results["efts"] = {"error": str(e)}
+
+    # Test S3 with EFTS object ID if we got one
+    obj_id = results.get("efts", {}).get("object_id")
+    if obj_id:
+        s3_url = f"https://s3.amazonaws.com/irs-form-990/{obj_id}_public.xml"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(s3_url)
+                results["s3"] = {"status": resp.status_code, "url": s3_url, "bytes": len(resp.content)}
+        except Exception as e:
+            results["s3"] = {"error": str(e)}
+
+    # Test apps.irs.gov index
+    index_url = "https://apps.irs.gov/pub/epostcard/990/xml/2023/index_2023.csv"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(index_url)
+            # Just grab first 200 chars to confirm it works
+            results["irs_index"] = {"status": resp.status_code, "preview": resp.text[:200]}
+    except Exception as e:
+        results["irs_index"] = {"error": str(e)}
+
+    return results
+
+
 @app.get("/search")
 async def search_by_name(name: str):
     """Quick name search to find an EIN before doing a full lookup."""
