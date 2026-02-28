@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import EntityGraphRequest, EntityGraphResponse, EntityNode, RelatedEntity
-from .propublica import get_organization, extract_object_ids
+from .propublica import get_organization
 from .irs_xml import get_schedule_r
 
 app = FastAPI(
@@ -58,9 +58,8 @@ async def lookup_entity_graph(req: EntityGraphRequest):
         state = org.get("state")
         revenue = org.get("revenue_amount")
 
-        # 2. Get Schedule R from IRS XML
-        object_ids = extract_object_ids(org_data)
-        raw_related, filing_year = await get_schedule_r(clean_ein, object_ids)
+        # 2. Get Schedule R from IRS XML (index CSV + streaming ZIP)
+        raw_related, filing_year = await get_schedule_r(clean_ein, [])
 
         total += 1
 
