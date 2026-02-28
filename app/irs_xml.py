@@ -171,30 +171,48 @@ def _object_id_to_zip_urls(object_id: str) -> list[str]:
 async def find_object_id_via_index(ein: str) -> tuple[str | None, str | None]:
     """
     Search IRS index CSVs to find the latest 990 ObjectId for an EIN.
+    Streams each CSV line-by-line — never loads the full file into memory.
     Returns (object_id, tax_period) or (None, None).
     """
     clean = ein.replace("-", "")
     current_year = datetime.date.today().year
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        for year in range(current_year, current_year - 5, -1):
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for year in range(current_year, current_year - 3, -1):
             url = f"{IRS_BASE}/{year}/index_{year}.csv"
+            best: dict | None = None
             try:
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    continue
-                reader = csv.DictReader(io.StringIO(resp.text))
-                matches = []
-                for row in reader:
-                    row_ein = row.get("EIN", "").strip().replace("-", "")
-                    if row_ein == clean and row.get("RETURN_TYPE", "").strip() == "990":
-                        matches.append(row)
-                if matches:
-                    matches.sort(key=lambda r: r.get("OBJECT_ID", ""), reverse=True)
-                    best = matches[0]
-                    return best.get("OBJECT_ID"), best.get("TAX_PERIOD")
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code != 200:
+                        continue
+                    header: list[str] | None = None
+                    line_buf = ""
+                    async for chunk in resp.aiter_text(chunk_size=65536):
+                        line_buf += chunk
+                        lines = line_buf.split("\n")
+                        line_buf = lines[-1]  # keep partial last line
+                        for raw_line in lines[:-1]:
+                            raw_line = raw_line.strip()
+                            if not raw_line:
+                                continue
+                            if header is None:
+                                header = [h.strip() for h in raw_line.split(",")]
+                                continue
+                            # Simple CSV split (field values don't contain commas)
+                            parts = raw_line.split(",")
+                            if len(parts) < len(header):
+                                continue
+                            row = dict(zip(header, parts))
+                            row_ein = row.get("EIN", "").strip().replace("-", "")
+                            if row_ein == clean and row.get("RETURN_TYPE", "").strip() == "990":
+                                # Keep highest OBJECT_ID (latest filing)
+                                if best is None or row.get("OBJECT_ID", "") > best.get("OBJECT_ID", ""):
+                                    best = row
             except Exception:
-                continue
+                pass
+
+            if best:
+                return best.get("OBJECT_ID"), best.get("TAX_PERIOD")
 
     return None, None
 
